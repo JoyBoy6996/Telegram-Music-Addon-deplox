@@ -219,6 +219,22 @@ Stream your library in any WebDAV media player or mount it as a network drive (`
 
 ---
 
+## Bot Pool for Concurrent Streaming
+
+By default, the server uses your user account session for all downloads. When multiple listeners stream simultaneously, a single account can become a bottleneck or hit Telegram rate limits (`FLOOD_WAIT`).
+
+You can configure a pool of up to 20 Telegram bots dedicated to handling audio downloads and streaming:
+
+1. **Create bots in BotFather:** Open [@BotFather](https://t.me/BotFather) in Telegram and create your bots with `/newbot`.
+2. **Add each bot as admin:** Add each created bot as an **administrator** to your private music channel so it has permission to access channel media.
+3. **Set the environment variable:** Add the comma-separated bot tokens in `.env`:
+   ```env
+   TELEGRAM_BOT_TOKENS=123456:ABC-DEF...,789012:GHI-JKL...
+   ```
+4. **Restart the server:** The addon initializes the bot pool, balances streaming across the least-busy bots (up to 4 concurrent streams each), manages isolated per-bot media caches, applies automatic flood cooldowns, and falls back to your user account seamlessly if bots are busy or unavailable.
+
+---
+
 ## Channel automation and library management
 
 > *Tip: Setting `TELEGRAM_BOT_TOKEN` (from [@BotFather](https://t.me/BotFather)) allows duplicate notices and digests to be posted cleanly by your bot instead of your personal account.*

@@ -15,6 +15,7 @@ const { NewMessage } = require('telegram/events');
 const mm = require('music-metadata');
 const setupApi = require('./setup-api');
 const tunnel = require('./tunnel');
+const { BotPool } = require('./botpool');
 
 setupApi.setGetActiveClient(() => client);
 setupApi.setGetTracksCount(() => trackIndex.length);
@@ -63,6 +64,7 @@ try {
 } catch (e) {
   // Optional local module
 }
+const botPool = new BotPool({ apiId: API_ID, apiHash: API_HASH });
 const PORT = process.env.PORT || 3000;
 const CLEANUP_DUPLICATES_ON_STARTUP = process.env.CLEANUP_DUPLICATES_ON_STARTUP === 'true';
 function getUrlSecret() {
@@ -376,8 +378,12 @@ function formatTrackDuration(sec) {
   return `${m}:${rem.toString().padStart(2, '0')}m`;
 }
 
-// Retrieve the Telegram msg.media object from RAM cache, or fetch once if not yet cached
-async function getMediaForTrack(trackId, forceRefresh = false) {
+// Retrieve the Telegram msg.media object from RAM cache, or fetch once if not yet cached.
+// If a bot instance is provided, delegates to botPool.getMedia (cached per bot).
+async function getMediaForTrack(trackId, forceRefresh = false, bot = null) {
+  if (bot && botPool) {
+    return botPool.getMedia(bot, trackId, forceRefresh);
+  }
   const key = String(trackId);
   if (!forceRefresh && mediaCache.has(key)) {
     return mediaCache.get(key);
@@ -437,13 +443,45 @@ function getBaseUrl(req) {
   return `${proto}://${host}${prefix}`;
 }
 
-async function getMediaChunk(media, offset = 0, maxBytes = 128 * 1024) {
+async function getMediaChunk(media, offset = 0, maxBytes = 128 * 1024, trackId = null) {
   const chunks = [];
   let downloaded = 0;
   const blockSize = 64 * 1024;
   const alignedOffset = Math.floor(offset / blockSize) * blockSize;
   let skipBytes = offset - alignedOffset;
   const totalToFetch = skipBytes + maxBytes;
+
+  let lease = botPool ? botPool.acquire() : null;
+  if (lease) {
+    try {
+      let botMedia = null;
+      if (trackId) {
+        botMedia = await botPool.getMedia(lease.bot, trackId);
+      }
+      if (botMedia) {
+        const iter = lease.bot.client.iterDownload({
+          file: botMedia,
+          offset: bigInt(alignedOffset),
+          requestSize: blockSize,
+        });
+        for await (const chunk of iter) {
+          chunks.push(chunk);
+          downloaded += chunk.length;
+          if (downloaded >= totalToFetch) {
+            iter.left = 0;
+            await iter.close().catch(() => {});
+            break;
+          }
+        }
+        const combined = Buffer.concat(chunks);
+        return combined.slice(skipBytes, skipBytes + maxBytes);
+      }
+    } catch (err) {
+      botPool.reportError(lease.bot, err);
+    } finally {
+      lease.release();
+    }
+  }
 
   try {
     const iter = client.iterDownload({
@@ -467,8 +505,8 @@ async function getMediaChunk(media, offset = 0, maxBytes = 128 * 1024) {
   }
 }
 
-function getHeaderChunk(media, maxBytes = 128 * 1024) {
-  return getMediaChunk(media, 0, maxBytes);
+function getHeaderChunk(media, maxBytes = 128 * 1024, trackId = null) {
+  return getMediaChunk(media, 0, maxBytes, trackId);
 }
 
 function hasEac3SyncWords(buf) {
@@ -523,59 +561,115 @@ async function prewarmTrackPreamble(trackId, media, title) {
   inFlightPrewarms.add(idStr);
 
   try {
-    let targetMedia = media || await getMediaForTrack(idStr);
-    if (!targetMedia) return;
+    let lease = botPool ? botPool.acquire() : null;
+    let targetClient = client;
+    let targetMedia = media;
+    let activeBot = null;
+
+    if (lease) {
+      try {
+        const bMedia = await botPool.getMedia(lease.bot, idStr);
+        if (bMedia) {
+          targetClient = lease.bot.client;
+          targetMedia = bMedia;
+          activeBot = lease.bot;
+        } else {
+          lease.release();
+          lease = null;
+        }
+      } catch (bErr) {
+        botPool.reportError(lease.bot, bErr);
+        lease.release();
+        lease = null;
+      }
+    }
+
+    if (!targetMedia) {
+      targetMedia = await getMediaForTrack(idStr);
+      if (!targetMedia) return;
+    }
 
     let hasRefreshed = false;
-    while (true) {
-      const iter = client.iterDownload({
-        file: targetMedia,
-        offset: bigInt(0),
-        requestSize: 512 * 1024,
-      });
-      inFlightPrewarmIters.set(idStr, iter);
+    try {
+      while (true) {
+        const iter = targetClient.iterDownload({
+          file: targetMedia,
+          offset: bigInt(0),
+          requestSize: 512 * 1024,
+        });
+        inFlightPrewarmIters.set(idStr, iter);
 
-      try {
-        const preambleChunks = [];
-        let bytesCollected = 0;
-        for await (const chunk of iter) {
-          if (!inFlightPrewarmIters.has(idStr)) {
-            iter.left = 0;
-            await iter.close().catch(() => {});
-            break;
+        try {
+          const preambleChunks = [];
+          let bytesCollected = 0;
+          for await (const chunk of iter) {
+            if (!inFlightPrewarmIters.has(idStr)) {
+              iter.left = 0;
+              await iter.close().catch(() => {});
+              break;
+            }
+            const needed = FAST_START_BYTES - bytesCollected;
+            preambleChunks.push(chunk.slice(0, needed));
+            bytesCollected += Math.min(chunk.length, needed);
+            if (bytesCollected >= FAST_START_BYTES) {
+              break;
+            }
           }
-          const needed = FAST_START_BYTES - bytesCollected;
-          preambleChunks.push(chunk.slice(0, needed));
-          bytesCollected += Math.min(chunk.length, needed);
-          if (bytesCollected >= FAST_START_BYTES) {
-            break;
+          if (preambleChunks.length > 0) {
+            const preamble = Buffer.concat(preambleChunks);
+            fastStartCache.set(idStr, preamble);
+            tagSliceCache.set(idStr, preamble.slice(0, Math.min(preamble.length, 256 * 1024)));
+            if (bytesCollected >= FAST_START_BYTES || !iter.left) {
+              const sizeFormatted = preamble.length >= 1024 * 1024
+                ? `${(preamble.length / (1024 * 1024)).toFixed(1)} MB`
+                : `${Math.round(preamble.length / 1024)} KB`;
+              logCli('BUFFER', `Prewarmed ${BOLD}${sizeFormatted}${RESET} -> ID: ${BOLD}${idStr}${RESET}`);
+            }
           }
+          iter.left = 0;
+          await iter.close().catch(() => {});
+          break;
+        } catch (err) {
+          if (activeBot) {
+            botPool.reportError(activeBot, err);
+          }
+          if (!hasRefreshed && isFileReferenceError(err)) {
+            hasRefreshed = true;
+            console.warn(`[FileRef] Pre-warm file reference expired for track ${idStr}. Refreshing...`);
+            if (activeBot) {
+              const freshMedia = await botPool.getMedia(activeBot, idStr, true);
+              if (freshMedia) {
+                targetMedia = freshMedia;
+                continue;
+              }
+            } else {
+              const freshMedia = await getMediaForTrack(idStr, true);
+              if (freshMedia) {
+                targetMedia = freshMedia;
+                continue;
+              }
+            }
+          }
+          // Fall back to user client if bot failed
+          if (activeBot) {
+            if (lease) {
+              lease.release();
+              lease = null;
+            }
+            activeBot = null;
+            targetClient = client;
+            targetMedia = await getMediaForTrack(idStr);
+            if (targetMedia) {
+              continue;
+            }
+          }
+          throw err;
         }
-        if (preambleChunks.length > 0) {
-          const preamble = Buffer.concat(preambleChunks);
-          fastStartCache.set(idStr, preamble);
-          tagSliceCache.set(idStr, preamble.slice(0, Math.min(preamble.length, 256 * 1024)));
-          if (bytesCollected >= FAST_START_BYTES || !iter.left) {
-            const sizeFormatted = preamble.length >= 1024 * 1024
-              ? `${(preamble.length / (1024 * 1024)).toFixed(1)} MB`
-              : `${Math.round(preamble.length / 1024)} KB`;
-            logCli('BUFFER', `Prewarmed ${BOLD}${sizeFormatted}${RESET} -> ID: ${BOLD}${idStr}${RESET}`);
-          }
-        }
-        iter.left = 0;
-        await iter.close().catch(() => {});
-        break;
-      } catch (err) {
-        if (!hasRefreshed && isFileReferenceError(err)) {
-          hasRefreshed = true;
-          console.warn(`[FileRef] Pre-warm file reference expired for track ${idStr}. Refreshing...`);
-          const freshMedia = await getMediaForTrack(idStr, true);
-          if (freshMedia) {
-            targetMedia = freshMedia;
-            continue;
-          }
-        }
-        throw err;
+      }
+    } finally {
+      if (lease) {
+        lease.release();
+        lease = null;
       }
     }
   } catch (err) {
@@ -625,7 +719,7 @@ async function parseTrackMessage(msg, cacheMedia = true) {
   let hasAlacAtom = false;
   if (shouldSniffTags) {
     try {
-      const headerBuf = await getHeaderChunk(msg.media, Math.min(128 * 1024, sizeBytes));
+      const headerBuf = await getHeaderChunk(msg.media, Math.min(128 * 1024, sizeBytes), msg.id);
       if (headerBuf && headerBuf.length > 0) {
         if (isMp4Container) {
           const headerStr = headerBuf.toString('latin1');
@@ -647,7 +741,7 @@ async function parseTrackMessage(msg, cacheMedia = true) {
           // If moov atom was not in the first 128KB, probe the last 128KB where moov sits in non-faststart MP4s
           if ((!hasEc3Atom || !duration) && sizeBytes > 128 * 1024 && !headerStr.includes('moov')) {
             const tailBytes = Math.min(128 * 1024, sizeBytes);
-            const tailBuf = await getMediaChunk(msg.media, sizeBytes - tailBytes, tailBytes);
+            const tailBuf = await getMediaChunk(msg.media, sizeBytes - tailBytes, tailBytes, msg.id);
             if (tailBuf && tailBuf.length > 0) {
               const tailStr = tailBuf.toString('latin1');
               if (tailStr.includes('ec-3') || tailStr.includes('dec3') || tailStr.includes('damf') || tailStr.includes('SpatialAudio')) {
@@ -2260,18 +2354,47 @@ app.get('/artwork/:id', async (req, res) => {
       return res.send(jpg);
     }
 
-    let targetMedia = media;
     let thumbBuf = null;
-    try {
-      thumbBuf = await client.downloadMedia(targetMedia, { thumb: 0 });
-    } catch (thumbErr) {
-      if (isFileReferenceError(thumbErr)) {
-        const freshMedia = await getMediaForTrack(req.params.id, true);
-        if (freshMedia) {
-          thumbBuf = await client.downloadMedia(freshMedia, { thumb: 0 });
+    let lease = botPool ? botPool.acquire() : null;
+
+    if (lease) {
+      try {
+        let botMedia = await botPool.getMedia(lease.bot, req.params.id);
+        if (botMedia) {
+          try {
+            thumbBuf = await lease.bot.client.downloadMedia(botMedia, { thumb: 0 });
+          } catch (tErr) {
+            if (isFileReferenceError(tErr)) {
+              botMedia = await botPool.getMedia(lease.bot, req.params.id, true);
+              if (botMedia) {
+                thumbBuf = await lease.bot.client.downloadMedia(botMedia, { thumb: 0 });
+              }
+            } else {
+              throw tErr;
+            }
+          }
         }
-      } else {
-        throw thumbErr;
+      } catch (botErr) {
+        botPool.reportError(lease.bot, botErr);
+      } finally {
+        lease.release();
+        lease = null;
+      }
+    }
+
+    if (!thumbBuf) {
+      let targetMedia = media;
+      try {
+        thumbBuf = await client.downloadMedia(targetMedia, { thumb: 0 });
+      } catch (thumbErr) {
+        if (isFileReferenceError(thumbErr)) {
+          const freshMedia = await getMediaForTrack(req.params.id, true);
+          if (freshMedia) {
+            thumbBuf = await client.downloadMedia(freshMedia, { thumb: 0 });
+          }
+        } else {
+          throw thumbErr;
+        }
       }
     }
 
@@ -2308,8 +2431,19 @@ async function streamAudioTrack(trackId, req, res) {
     const track = findTrack(trackId);
     if (!track) return res.status(404).send('Track not found');
 
-    const media = await getMediaForTrack(trackId);
-    if (!media) return res.status(404).send('Media not found');
+    let totalSize = Number(track.sizeBytes) || 0;
+    let initialUserMedia = null;
+    if (!totalSize) {
+      initialUserMedia = await getMediaForTrack(trackId);
+      totalSize = Number(initialUserMedia?.document?.size) || 0;
+      if (totalSize) {
+        track.sizeBytes = totalSize;
+      }
+    }
+    if (!totalSize || isNaN(totalSize)) {
+      console.error(`Invalid totalSize for track ${trackId}`);
+      return res.status(500).send('Unable to determine audio file size');
+    }
 
     if (isConnectionClosed) return;
 
@@ -2321,15 +2455,6 @@ async function streamAudioTrack(trackId, req, res) {
         bgIter.left = 0;
         if (typeof bgIter.close === 'function') bgIter.close().catch(() => {});
       }
-    }
-
-    const totalSize = Number(track.sizeBytes) || Number(media.document?.size) || 0;
-    if (!totalSize || isNaN(totalSize)) {
-      console.error(`Invalid totalSize for track ${trackId}`);
-      return res.status(500).send('Unable to determine audio file size');
-    }
-    if (!track.sizeBytes) {
-      track.sizeBytes = totalSize;
     }
 
     let start = 0;
@@ -2509,112 +2634,179 @@ async function streamAudioTrack(trackId, req, res) {
     }
 
     // Stream remaining bytes live from Telegram MTProto
-    let currentMedia = media;
+    let lease = botPool ? botPool.acquire() : null;
+    let activeClient = client;
+    let currentMedia = null;
+    let activeBot = null;
+
+    if (lease) {
+      try {
+        currentMedia = await botPool.getMedia(lease.bot, trackId);
+        if (currentMedia) {
+          activeClient = lease.bot.client;
+          activeBot = lease.bot;
+          console.log(`[BotPool] ${lease.bot.id} -> track ${trackId}`);
+        } else {
+          lease.release();
+          lease = null;
+        }
+      } catch (bErr) {
+        botPool.reportError(lease.bot, bErr);
+        lease.release();
+        lease = null;
+      }
+    }
+
+    if (!currentMedia) {
+      currentMedia = initialUserMedia || await getMediaForTrack(trackId);
+      activeClient = client;
+      activeBot = null;
+    }
+
+    if (!currentMedia) {
+      if (!res.headersSent) res.status(404).send('Media not found');
+      return;
+    }
+
     let hasRefreshedRef = false;
     let existingCacheBuf = fastStartCache.get(trackId);
     let cacheBytesCollected = existingCacheBuf ? existingCacheBuf.length : 0;
     const preambleChunks = existingCacheBuf ? [existingCacheBuf] : [];
 
-    while (bytesSent < bytesNeeded && !isConnectionClosed && !res.writableEnded && !res.destroyed) {
-      const currentBytePos = start + bytesSent;
-      // Align request offset to dynamicBlockSize boundary to prevent MTProto 400: OFFSET_INVALID
-      const alignedOffset = Math.floor(currentBytePos / dynamicBlockSize) * dynamicBlockSize;
-      let skipBytes = currentBytePos - alignedOffset;
+    try {
+      while (bytesSent < bytesNeeded && !isConnectionClosed && !res.writableEnded && !res.destroyed) {
+        const currentBytePos = start + bytesSent;
+        // Align request offset to dynamicBlockSize boundary to prevent MTProto 400: OFFSET_INVALID
+        const alignedOffset = Math.floor(currentBytePos / dynamicBlockSize) * dynamicBlockSize;
+        let skipBytes = currentBytePos - alignedOffset;
 
-      iterator = client.iterDownload({
-        file: currentMedia,
-        offset: bigInt(alignedOffset),
-        requestSize: dynamicBlockSize,
-      });
+        iterator = activeClient.iterDownload({
+          file: currentMedia,
+          offset: bigInt(alignedOffset),
+          requestSize: dynamicBlockSize,
+        });
 
-      try {
-        for await (const chunk of iterator) {
-          if (isConnectionClosed || res.writableEnded || res.destroyed) {
-            iterator.left = 0;
-            await iterator.close().catch(() => {});
-            break;
-          }
+        try {
+          for await (const chunk of iterator) {
+            if (isConnectionClosed || res.writableEnded || res.destroyed) {
+              iterator.left = 0;
+              await iterator.close().catch(() => {});
+              break;
+            }
 
-          if (start === 0 && !tagSliceCache.has(trackId)) {
-            const sliceLen = Math.min(256 * 1024, chunk.length);
-            if (sliceLen > 0) {
-              tagSliceCache.set(trackId, chunk.slice(0, sliceLen));
+            if (start === 0 && !tagSliceCache.has(trackId)) {
+              const sliceLen = Math.min(256 * 1024, chunk.length);
+              if (sliceLen > 0) {
+                tagSliceCache.set(trackId, chunk.slice(0, sliceLen));
+              }
+            }
+
+            // Populate/extend fastStartCache up to FAST_START_BYTES only for real playback starts (start === 0)
+            // This prevents background tag reads from evicting playing songs from RAM cache!
+            if (start === 0 && alignedOffset === cacheBytesCollected && cacheBytesCollected < FAST_START_BYTES) {
+              const needed = FAST_START_BYTES - cacheBytesCollected;
+              const slice = chunk.slice(0, needed);
+              preambleChunks.push(slice);
+              cacheBytesCollected += slice.length;
+              if (cacheBytesCollected >= FAST_START_BYTES || cacheBytesCollected >= totalSize) {
+                const fullPreamble = Buffer.concat(preambleChunks);
+                fastStartCache.set(trackId, fullPreamble);
+                tagSliceCache.set(trackId, fullPreamble.slice(0, Math.min(fullPreamble.length, 256 * 1024)));
+                const sizeFormatted = fullPreamble.length >= 1024 * 1024
+                  ? `${(fullPreamble.length / (1024 * 1024)).toFixed(1)} MB`
+                  : `${Math.round(fullPreamble.length / 1024)} KB`;
+                if (!isWebDav) {
+                  logCli('BUFFER', `Prewarmed ${BOLD}${sizeFormatted}${RESET} -> ID: ${BOLD}${trackId}${RESET}`);
+                }
+              } else {
+                const partial = Buffer.concat(preambleChunks);
+                fastStartCache.set(trackId, partial);
+                tagSliceCache.set(trackId, partial.slice(0, Math.min(partial.length, 256 * 1024)));
+              }
+            }
+
+            // Discard unaligned preamble if currentBytePos was not on a block boundary
+            let usableChunk = chunk;
+            if (skipBytes > 0) {
+              if (chunk.length <= skipBytes) {
+                skipBytes -= chunk.length;
+                continue;
+              }
+              usableChunk = chunk.slice(skipBytes);
+              skipBytes = 0;
+            }
+
+            let toSend = usableChunk;
+            let shouldBreak = false;
+
+            if (bytesSent + usableChunk.length > bytesNeeded) {
+              toSend = usableChunk.slice(0, bytesNeeded - bytesSent);
+              shouldBreak = true;
+            }
+
+            bytesSent += toSend.length;
+            maybeLogPlayback(bytesSent);
+            if (bytesSent >= bytesNeeded) {
+              shouldBreak = true;
+            }
+
+            const canContinue = res.write(toSend);
+            if (!canContinue && !res.writableEnded && !res.destroyed && !isConnectionClosed) {
+              await waitForDrain();
+            }
+
+            if (shouldBreak || isConnectionClosed) {
+              iterator.left = 0;
+              await iterator.close().catch(() => {});
+              break;
             }
           }
-
-          // Populate/extend fastStartCache up to FAST_START_BYTES only for real playback starts (start === 0)
-          // This prevents background tag reads from evicting playing songs from RAM cache!
-          if (start === 0 && alignedOffset === cacheBytesCollected && cacheBytesCollected < FAST_START_BYTES) {
-            const needed = FAST_START_BYTES - cacheBytesCollected;
-            const slice = chunk.slice(0, needed);
-            preambleChunks.push(slice);
-            cacheBytesCollected += slice.length;
-            if (cacheBytesCollected >= FAST_START_BYTES || cacheBytesCollected >= totalSize) {
-              const fullPreamble = Buffer.concat(preambleChunks);
-              fastStartCache.set(trackId, fullPreamble);
-              tagSliceCache.set(trackId, fullPreamble.slice(0, Math.min(fullPreamble.length, 256 * 1024)));
-              const sizeFormatted = fullPreamble.length >= 1024 * 1024
-                ? `${(fullPreamble.length / (1024 * 1024)).toFixed(1)} MB`
-                : `${Math.round(fullPreamble.length / 1024)} KB`;
-              if (!isWebDav) {
-                logCli('BUFFER', `Prewarmed ${BOLD}${sizeFormatted}${RESET} -> ID: ${BOLD}${trackId}${RESET}`);
+          break;
+        } catch (iterErr) {
+          if (activeBot) {
+            botPool.reportError(activeBot, iterErr);
+          }
+          if (!hasRefreshedRef && isFileReferenceError(iterErr)) {
+            hasRefreshedRef = true;
+            console.warn(`[FileRef] File reference expired for "${track.title}" (ID: ${trackId}). Refreshing from Telegram cloud...`);
+            if (activeBot) {
+              const freshMedia = await botPool.getMedia(activeBot, trackId, true);
+              if (freshMedia) {
+                currentMedia = freshMedia;
+                console.log(`[FileRef] Refreshed bot file reference for "${track.title}" (ID: ${trackId}). Resuming stream from byte ${start + bytesSent}...`);
+                continue;
               }
             } else {
-              const partial = Buffer.concat(preambleChunks);
-              fastStartCache.set(trackId, partial);
-              tagSliceCache.set(trackId, partial.slice(0, Math.min(partial.length, 256 * 1024)));
+              const freshMedia = await getMediaForTrack(trackId, true);
+              if (freshMedia) {
+                currentMedia = freshMedia;
+                console.log(`[FileRef] Refreshed file reference for "${track.title}" (ID: ${trackId}). Resuming stream from byte ${start + bytesSent}...`);
+                continue;
+              }
             }
           }
-
-          // Discard unaligned preamble if currentBytePos was not on a block boundary
-          let usableChunk = chunk;
-          if (skipBytes > 0) {
-            if (chunk.length <= skipBytes) {
-              skipBytes -= chunk.length;
+          // If a bot encountered an error, fall back to user client
+          if (activeBot) {
+            console.warn(`[BotPool] ${activeBot.id} error on track ${trackId} (${iterErr.message}), falling back to user client...`);
+            if (lease) {
+              lease.release();
+              lease = null;
+            }
+            activeBot = null;
+            activeClient = client;
+            const freshUserMedia = await getMediaForTrack(trackId);
+            if (freshUserMedia) {
+              currentMedia = freshUserMedia;
               continue;
             }
-            usableChunk = chunk.slice(skipBytes);
-            skipBytes = 0;
           }
-
-          let toSend = usableChunk;
-          let shouldBreak = false;
-
-          if (bytesSent + usableChunk.length > bytesNeeded) {
-            toSend = usableChunk.slice(0, bytesNeeded - bytesSent);
-            shouldBreak = true;
-          }
-
-          bytesSent += toSend.length;
-          maybeLogPlayback(bytesSent);
-          if (bytesSent >= bytesNeeded) {
-            shouldBreak = true;
-          }
-
-          const canContinue = res.write(toSend);
-          if (!canContinue && !res.writableEnded && !res.destroyed && !isConnectionClosed) {
-            await waitForDrain();
-          }
-
-          if (shouldBreak || isConnectionClosed) {
-            iterator.left = 0;
-            await iterator.close().catch(() => {});
-            break;
-          }
+          throw iterErr;
         }
-        break;
-      } catch (iterErr) {
-        if (!hasRefreshedRef && isFileReferenceError(iterErr)) {
-          hasRefreshedRef = true;
-          console.warn(`[FileRef] File reference expired for "${track.title}" (ID: ${trackId}). Refreshing from Telegram cloud...`);
-          const freshMedia = await getMediaForTrack(trackId, true);
-          if (freshMedia) {
-            currentMedia = freshMedia;
-            console.log(`[FileRef] Refreshed file reference for "${track.title}" (ID: ${trackId}). Resuming stream from byte ${start + bytesSent}...`);
-            continue;
-          }
-        }
-        throw iterErr;
+      }
+    } finally {
+      if (lease) {
+        lease.release();
+        lease = null;
       }
     }
 
@@ -3108,6 +3300,14 @@ async function startTelegramService() {
     const chanId = channelEntity.id ? ` ${DIM}(ID: ${channelEntity.id})${RESET}` : '';
     logCli('CHANNEL', `Connected to ${BOLD}${chanTitle}${RESET}${chanId}`);
 
+    if (botPool) {
+      try {
+        await botPool.init(channelEntity || currentChannel);
+      } catch (poolErr) {
+        console.warn(`[BotPool] Initialization failed: ${poolErr.message}`);
+      }
+    }
+
     if (teledrive) {
       await teledrive.initTeleDrive(client, channelEntity, resolveChannel);
     }
@@ -3368,6 +3568,10 @@ function printUrlBanner(label, urlStr) {
         require('dotenv').config({ override: true });
         mediaCache.clear();
         fastStartCache.clear();
+        if (botPool) {
+          botPool.apiId = parseInt(cleanEnv(process.env.TELEGRAM_API_ID), 10) || API_ID;
+          botPool.apiHash = cleanEnv(process.env.TELEGRAM_API_HASH) || API_HASH;
+        }
         isTelegramReady = false;
         isStartupComplete = false;
         hasInsertedStartupGap = false;
